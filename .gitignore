@@ -1,0 +1,6 @@
+.env
+chroma_db/
+tiktoken_cache/
+__pycache__/
+data/
+build/ dist/ *.exe *.pkg
