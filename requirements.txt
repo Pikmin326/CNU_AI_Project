@@ -6,3 +6,6 @@ llama-index-llms-google-genai
 llama-index-embeddings-huggingface
 python-dotenv
 protobuf==3.20.3
+pymupdf
+pandas
+openpyxl

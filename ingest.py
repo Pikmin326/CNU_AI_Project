@@ -1,100 +1,135 @@
 import os
 import re
-import sys
 import time
 import json
 import requests
 import chromadb
-import traceback
+import pandas as pd
+import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
 from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core import StorageContext,VectorStoreIndex, Document, Settings
+from llama_index.core import StorageContext, VectorStoreIndex, Document, Settings
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
 load_dotenv()
-os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
-os.environ["TIKTOKEN_CACHE_DIR"] = "./tiktoken_cache"
-PERSIST_DIR = os.getenv("PERSIST_DIR", "./default_storage")
 DATA_DIR = "./data"
-chroma_tenant = os.getenv("CHROMA_TENANT")
-chroma_database = os.getenv("CHROMA_DATABASE")
-chroma_api_key = os.getenv("CHROMA_API_KEY")
+FILE_DIR = "./data/attachments"
+STATE_FILE = "./crawl_state.json" # 증분 수집을 위한 상태 저장 파일
 
+# 1. 파일 파서 정의 (PDF, Excel)[cite: 1]
+def parse_pdf(file_path):
+    text = ""
+    try:
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text += page.get_text() + "\n"
+    except Exception as e:
+        print(f"⚠️ PDF 파싱 에러: {e}")
+    return text
+
+def parse_excel(file_path):
+    try:
+        df = pd.read_excel(file_path)
+        return df.to_markdown(index=False)
+    except Exception as e:
+        print(f"⚠️ Excel 파싱 에러: {e}")
+        return ""
+
+# 2. 증분 수집 상태 관리
+def get_last_crawl_date():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return datetime.strptime(json.load(f)["last_date"], "%y.%m.%d")
+    return datetime.now() - timedelta(days=365) # 초기 실행 시 1년 전
+
+def save_last_crawl_date(date_obj):
+    with open(STATE_FILE, "w") as f:
+        json.dump({"last_date": date_obj.strftime("%y.%m.%d")}, f)
+
+# 3. 통합 크롤링 함수
 def crawl_cnupa_notices():
-    print("🌐 [크롤링 시작] 최근 12개월 이내의 공지를 수집합니다...")
-    
-    limit_date = datetime.now() - timedelta(days=365)
+    last_limit_date = get_last_crawl_date()
+    new_max_date = last_limit_date
     base_url = "https://cnupa.cnu.ac.kr/pa/notice/notice.do"
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
+    if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
+    if not os.path.exists(FILE_DIR): os.makedirs(FILE_DIR)
 
-    try:
-        response = requests.get(base_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        # 테이블의 모든 행(tr)을 가져옵니다.
-        rows = soup.select('table.board-table tbody tr') 
+    limit = 10
+    offset = 0
+    total_new_docs = 0
+    stop_signal = False
 
-        count = 0
-        for row in rows:
-            tds = row.select('td')
-            if not tds: continue
+    while not stop_signal:
+        page_url = f"{base_url}?articleLimit={limit}&article.offset={offset}"
+        print(f"🔍 Analyzing Offset: {offset}")
+        
+        try:
+            res = requests.get(page_url, headers=headers, timeout=10)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            rows = soup.select('table.board-table tbody tr')
 
-            # 행 전체의 텍스트를 하나로 합칩니다.
-            row_text = row.get_text(separator=" ", strip=True)
+            if not rows: break
 
-            # 정규표현식으로 '26.04.30' 같은 패턴을 찾습니다.
-            # \d{2}는 숫자 2개, \.은 점을 의미합니다.
-            match = re.search(r'(\d{2}\.\d{2}\.\d{2})', row_text)
-
-            if not match:
-                continue # 날짜 패턴이 없으면 스킵
-
-            try:
-                # 패턴에 맞는 첫 번째 결과(날짜)만 추출합니다.
-                clean_date = match.group(1)
-                post_date = datetime.strptime(clean_date, "%y.%m.%d")
+            for row in rows:
+                # 날짜 추출
+                date_match = re.search(r'(\d{2}\.\d{2}\.\d{2})', row.get_text())
+                if not date_match: continue
                 
-                if post_date < limit_date:
-                    continue
-                
-                # 4. 상세 페이지 링크 추출
-                link_tag = row.find('a', href=True)
-                if link_tag and "mode=view" in link_tag['href']:
-                    title = link_tag.get_text(strip=True)
-                    href = link_tag['href']
-                    detail_url = base_url + href if href.startswith('?') else href
-                    
-                    # 상세 내용 수집
-                    time.sleep(2.0)
-                    post_res = requests.get(detail_url, headers=headers)
-                    post_soup = BeautifulSoup(post_res.text, 'html.parser')
-                    
-                    selectors = ['div.fr-view', 'div.board-view-content', 'div.v-content']
-                    content_area = next((post_soup.select_one(s) for s in selectors if post_soup.select_one(s)), None)
-                    content = content_area.get_text(separator="\n", strip=True) if content_area else "본문 내용을 찾을 수 없습니다."
+                curr_date = datetime.strptime(date_match.group(1), "%y.%m.%d")
 
-                    # JSON 저장
-                    notice_data = {"title": title, "url": detail_url, "content": content}
-                    safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '_')]).strip()
-                    
-                    with open(os.path.join(DATA_DIR, f"{safe_title}.json"), "w", encoding="utf-8") as f:
-                        json.dump(notice_data, f, ensure_ascii=False, indent=4)
-                    
-                    count += 1
-                    print(f"  [{count}] 수집 성공: {title} ({clean_date})")
-                    
-            except Exception as inner_error:
-                # 내부 루프 에러 시 'inner_error' 객체를 안전하게 출력
-                print(f"⚠️ 개별 항목 처리 중 오류 발생: {inner_error}")
-                continue
+                # 증분 수집 로직: 저장된 날짜보다 이전 글이면 크롤링 완전 중단
+                if curr_date <= last_limit_date:
+                    stop_signal = True
+                    break
 
-        print(f"✅ 총 {count}개의 최신 공지가 수집되었습니다.")
-    except Exception as outer_error:
-        print(f"❌ 크롤링 중 치명적 오류 발생: {outer_error}")
+                if curr_date > new_max_date: new_max_date = curr_date
+
+                # 상세 정보 수집 및 첨부파일 처리[cite: 3]
+                link = row.find('a', href=True)
+                if link:
+                    title = link.get_text(strip=True)
+                    detail_url = base_url + link['href'] if link['href'].startswith('?') else link['href']
+                    
+                    p_res = requests.get(detail_url, headers=headers)
+                    p_soup = BeautifulSoup(p_res.text, 'html.parser')
+                    
+                    content = p_soup.select_one('div.fr-view').get_text(strip=True) if p_soup.select_one('div.fr-view') else ""
+                    
+                    # 첨부파일 다운로드 및 본문에 병합[cite: 1, 3]
+                    attach_text = ""
+                    for a_tag in p_soup.select('a[href*="download"]'):
+                        f_url = base_url + a_tag['href'] if a_tag['href'].startswith('?') else a_tag['href']
+                        f_name = a_tag.get_text(strip=True)
+                        f_path = os.path.join(FILE_DIR, f_name)
+                        
+                        f_res = requests.get(f_url)
+                        with open(f_path, "wb") as f: f.write(f_res.content)
+                        
+                        ext = os.path.splitext(f_name)[1].lower()
+                        if ext == ".pdf": attach_text += f"\n[PDF내용: {f_name}]\n" + parse_pdf(f_path)
+                        elif ext in [".xls", ".xlsx"]: attach_text += f"\n[Excel내용: {f_name}]\n" + parse_excel(f_path)
+
+                    # 저장[cite: 3]
+                    combined_data = {"title": title, "url": detail_url, "content": content + attach_text}
+                    safe_name = "".join([c for c in title if c.isalnum() or c in (' ', '_')]).strip()
+                    with open(os.path.join(DATA_DIR, f"{safe_name}.json"), "w", encoding="utf-8") as f:
+                        json.dump(combined_data, f, ensure_ascii=False, indent=4)
+                    
+                    total_new_docs += 1
+
+            offset += limit
+            time.sleep(2.0) # 서버 매너
+            
+        except Exception as e:
+            print(f"❌ Critical Error during crawl: {e}")
+            break
+
+    save_last_crawl_date(new_max_date)
+    print(f"✅ 수집 완료: 새로운 문서 {total_new_docs}개 발견.")
         
 def load_json_documents():
     print("📂 [데이터 로드] JSON 파일에서 문서와 출처를 읽어옵니다...")
