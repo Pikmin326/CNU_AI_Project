@@ -143,7 +143,7 @@ def crawl_cnupa_notices():
 
             if stop_signal: break
             offset += limit
-            time.sleep(1.0)
+            time.sleep(2.0)
             
         except Exception as e:
             print(f"❌ 오류 발생: {e}"); break
@@ -192,7 +192,7 @@ def main():
         chroma_collection = db.get_or_create_collection(collection_name)
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+        VectorStoreIndex.from_documents(documents, storage_context=storage_context, insert_batch_size=500)
         
         print("\n" + "="*50)
         print("🚀 크로마 클라우드 원격 인덱싱 완료! 이제 app.py를 준비하세요.")
